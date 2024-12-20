@@ -143,3 +143,123 @@ class PeccMiddleware
 // Example usage
 $middleware = new PeccMiddleware();
 $middleware->handle($_SERVER, json_decode(file_get_contents('php://input'), true));
+
+
+// ----
+
+<?php
+
+declare(strict_types=1);
+
+namespace App\Middleware;
+
+use Exception;
+use PDO;
+
+class PeccMiddleware
+{
+    private const CONFIG_FILE = __DIR__ . '/config.php';
+    private array $config;
+    private PDO $db;
+
+    public function __construct()
+    {
+        $this->loadConfig();
+        $this->db = new PDO($this->config['db_dsn'], $this->config['db_user'], $this->config['db_password']);
+    }
+
+    public function handle(array $server, array $requestBody): void
+    {
+        try {
+            $this->validateApiKey($server);
+
+            $operation = $requestBody['operation'] ?? null;
+            if ($operation === 'consult') {
+                $this->processConsultation($requestBody);
+            } elseif ($operation === 'reserve') {
+                $this->processReservation($requestBody);
+            } else {
+                throw new Exception('Invalid operation type.');
+            }
+        } catch (Exception $e) {
+            http_response_code(400);
+            echo json_encode(['success' => false, 'message' => $e->getMessage()]);
+        }
+    }
+
+    private function loadConfig(): void
+    {
+        if (!file_exists(self::CONFIG_FILE)) {
+            throw new Exception('Configuration file not found.');
+        }
+        $this->config = require self::CONFIG_FILE;
+    }
+
+    private function validateApiKey(array $server): void
+    {
+        $apiKey = $server['HTTP_' . str_replace('-', '_', strtoupper($this->config['api_key_header']))] ?? '';
+        if (empty($apiKey) || $apiKey !== $this->config['api_key']) {
+            throw new Exception('Invalid or missing API key.');
+        }
+    }
+
+    private function processConsultation(array $requestBody): void
+    {
+        $response = $this->communicateWithPecc('/pecc/v1/check/consult', $requestBody);
+        $this->handleResponse($response, 'consultation');
+    }
+
+    private function processReservation(array $requestBody): void
+    {
+        $response = $this->communicateWithPecc('/pecc/v1/check/reserve', $requestBody);
+        $this->handleResponse($response, 'reservation');
+        $this->storeTransaction($requestBody['check_number'], $requestBody['amount'], 'reserved');
+    }
+
+    private function communicateWithPecc(string $endpoint, array $data): array
+    {
+        $url = $this->config['pecc_api_base_url'] . $endpoint;
+        $ch = curl_init($url);
+
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_POST, true);
+        curl_setopt($ch, CURLOPT_HTTPHEADER, [
+            'Content-Type: application/json',
+            'Api-Key: ' . $this->config['pecc_api_key']
+        ]);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($data));
+
+        $response = curl_exec($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+
+        if ($httpCode !== 200) {
+            throw new Exception('PECC API communication error. HTTP Code: ' . $httpCode);
+        }
+
+        return json_decode($response, true);
+    }
+
+    private function handleResponse(array $response, string $operationType): void
+    {
+        if (!$response['success']) {
+            throw new Exception("Error during $operationType: " . ($response['message'] ?? 'Unknown error'));
+        }
+
+        echo json_encode(['success' => true, 'message' => "$operationType successful", 'details' => $response]);
+    }
+
+    private function storeTransaction(string $checkNumber, float $amount, string $status): void
+    {
+        $stmt = $this->db->prepare('INSERT INTO transactions (check_number, amount, status) VALUES (:check_number, :amount, :status)');
+        $stmt->execute([
+            ':check_number' => $checkNumber,
+            ':amount' => $amount,
+            ':status' => $status,
+        ]);
+    }
+}
+
+// Example usage
+$middleware = new PeccMiddleware();
+$middleware->handle($_SERVER, json_decode(file_get_contents('php://input'), true));
